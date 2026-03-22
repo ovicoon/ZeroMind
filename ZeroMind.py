@@ -4,10 +4,10 @@ os.chdir(os.path.dirname(__file__))
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import math
 
 # =========================
-# 1. 커스텀 16차원 임베딩 정의
-# [자음, 모음, 된소리, 거센소리, 비음, 유음, 마찰음, 파열음, 파찰음, 겹받침, 양성모, 전설모, 원순모, 강도, 복합모음, END]
+# 1. 커스텀 16차원 임베딩
 # =========================
 phoneme_to_vec = {
     # --- 단자음 ---
@@ -67,27 +67,108 @@ phoneme_to_vec = {
     "ㅒ": [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0],
     "ㅖ": [0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0],
     # --- 특수 ---
+    "<pad>": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
     "<end>": [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
 }
 
 EMBED_DIM = 16
+MAX_SEQ = 10  # 최대 몇 개 토큰까지 볼지
 
-# =========================
-# 2. 토큰 정의
-# =========================
 tokens = list(phoneme_to_vec.keys())
 token_to_id = {t: i for i, t in enumerate(tokens)}
 id_to_token = {i: t for t, i in token_to_id.items()}
 vocab_size = len(tokens)
 
 
-def token_to_tensor(token: str) -> torch.Tensor:
-    """토큰 → shape (1, 16) float 텐서 (고정값, 학습 안 됨)"""
-    return torch.tensor([phoneme_to_vec[token]], dtype=torch.float32)
+def seq_to_tensor(token_list: list) -> torch.Tensor:
+    """
+    토큰 리스트 → (seq_len, 1, 16) 텐서
+    ex) ["ㅎ", "ㅏ", "ㄴ"] → shape (3, 1, 16)
+    """
+    vecs = [phoneme_to_vec[t] for t in token_list]
+    return torch.tensor(vecs, dtype=torch.float32).unsqueeze(1)  # (seq, 1, dim)
 
 
 # =========================
-# 3. 학습 데이터 (한국어 자모 시퀀스)
+# 2. Attention 모듈
+# =========================
+class SingleHeadAttention(nn.Module):
+    """
+    경량 Single-Head Attention
+    파라미터: W_Q(16x16) + W_K(16x16) + W_V(16x16) = 768개
+    """
+
+    def __init__(self, dim=EMBED_DIM):
+        super().__init__()
+        self.W_Q = nn.Linear(dim, dim, bias=False)  # 질문 변환
+        self.W_K = nn.Linear(dim, dim, bias=False)  # 답변 변환
+        self.W_V = nn.Linear(dim, dim, bias=False)  # 내용 변환
+        self.scale = math.sqrt(dim)  # 유사도 스케일 조정
+
+    def forward(self, x):
+        # x: (seq_len, 1, 16)
+        Q = self.W_Q(x)  # (seq_len, 1, 16) — 질문
+        K = self.W_K(x)  # (seq_len, 1, 16) — 답변
+        V = self.W_V(x)  # (seq_len, 1, 16) — 내용
+
+        # Q·K^T: 각 토큰끼리 유사도 계산
+        # (seq_len, 16) x (16, seq_len) = (seq_len, seq_len)
+        Q_ = Q.squeeze(1)  # (seq_len, 16)
+        K_ = K.squeeze(1)  # (seq_len, 16)
+        V_ = V.squeeze(1)  # (seq_len, 16)
+
+        scores = torch.matmul(Q_, K_.T) / self.scale  # (seq_len, seq_len)
+
+        # 미래 토큰은 보면 안 됨 → 마스킹 (현재 이전만 볼 수 있게)
+        seq_len = x.size(0)
+        mask = torch.triu(torch.ones(seq_len, seq_len), diagonal=1).bool()
+        scores = scores.masked_fill(mask, float("-inf"))
+
+        weights = torch.softmax(scores, dim=-1)  # (seq_len, seq_len)
+
+        # 가중치 × V → 문맥이 담긴 벡터
+        out = torch.matmul(weights, V_)  # (seq_len, 16)
+        return out.unsqueeze(1)  # (seq_len, 1, 16)
+
+
+# =========================
+# 3. 모델
+# =========================
+class LightAttentionLM(nn.Module):
+    """
+    전체 파라미터:
+      Attention : 16×16 × 3 = 768개
+      fc1       : 16×32     = 512개
+      fc2       : 32×vocab  = 32×58 ≈ 1856개
+      합계       : ~3136개   ← 극도로 가벼움
+    """
+
+    def __init__(self, vocab_size, dim=EMBED_DIM, hidden=32):
+        super().__init__()
+        self.attention = SingleHeadAttention(dim)
+        self.fc1 = nn.Linear(dim, hidden)
+        self.relu = nn.ReLU()
+        self.fc2 = nn.Linear(hidden, vocab_size)
+
+    def forward(self, x):
+        # x: (seq_len, 1, 16)
+        ctx = self.attention(x)  # (seq_len, 1, 16) — 문맥 반영된 벡터
+        last = ctx[-1]  # (1, 16) — 마지막 토큰의 문맥 벡터만 사용
+        h = self.relu(self.fc1(last))  # (1, hidden)
+        out = self.fc2(h)  # (1, vocab_size)
+        return out
+
+
+model = LightAttentionLM(vocab_size)
+optimizer = optim.Adam(model.parameters(), lr=0.01)
+loss_fn = nn.CrossEntropyLoss()
+
+# 파라미터 수 출력
+total_params = sum(p.numel() for p in model.parameters())
+print(f"총 파라미터 수: {total_params}개")
+
+# =========================
+# 4. 학습 데이터
 # =========================
 sentences = [
     ["ㅎ", "ㅏ", "ㄴ", "ㅡ", "ㄹ", "<end>"],  # 하늘
@@ -98,43 +179,40 @@ sentences = [
 ]
 
 
-# =========================
-# 4. 모델 (입력: 고정 16D 벡터 → 출력: vocab 분류)
-# =========================
-class SimpleLM(nn.Module):
-    def __init__(self, vocab_size, input_dim=EMBED_DIM, hidden_dim=32):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_dim, vocab_size)
+def make_training_data(sentences):
+    """
+    문장 → (입력 시퀀스, 정답) 쌍 생성
+    ex) ["ㅎ","ㅏ","ㄴ","ㅡ","ㄹ","<end>"]
+        → (["ㅎ"],           "ㅏ")
+           (["ㅎ","ㅏ"],      "ㄴ")
+           (["ㅎ","ㅏ","ㄴ"], "ㅡ")  ...
+    """
+    data = []
+    for sent in sentences:
+        for i in range(len(sent) - 1):
+            input_seq = sent[: i + 1]  # 처음부터 현재까지 전부
+            target = sent[i + 1]  # 다음 토큰
+            data.append((input_seq, target))
+    return data
 
-    def forward(self, x):
-        # x: (1, 16) — 고정 커스텀 임베딩 벡터
-        h = self.relu(self.fc1(x))  # (1, hidden_dim)
-        out = self.fc2(h)  # (1, vocab_size)
-        return out
 
-
-model = SimpleLM(vocab_size)
-optimizer = optim.Adam(model.parameters(), lr=0.01)
-loss_fn = nn.CrossEntropyLoss()
+training_data = make_training_data(sentences)
 
 # =========================
 # 5. 학습
 # =========================
-for epoch in range(300):
+for epoch in range(500):
     total_loss = 0
-    for sent in sentences:
-        for i in range(len(sent) - 1):
-            x = token_to_tensor(sent[i])
-            y = torch.tensor([token_to_id[sent[i + 1]]])
-            pred = model(x)
-            loss = loss_fn(pred, y)
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
-    if epoch % 50 == 0:
+    for input_seq, target in training_data:
+        x = seq_to_tensor(input_seq)  # (seq_len, 1, 16)
+        y = torch.tensor([token_to_id[target]])
+        pred = model(x)
+        loss = loss_fn(pred, y)
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    if epoch % 100 == 0:
         print(f"epoch {epoch}, loss {total_loss:.4f}")
 
 
@@ -142,26 +220,22 @@ for epoch in range(300):
 # 6. 생성 함수
 # =========================
 def generate(start_token, max_len=10):
-    current = start_token
-    result = [current]
+    result = [start_token]
     for _ in range(max_len):
-        x = token_to_tensor(current)
+        x = seq_to_tensor(result)  # 지금까지 생성된 전체 시퀀스
         pred = model(x)
         next_id = torch.argmax(pred).item()
         next_token = id_to_token[next_id]
         if next_token == "<end>":
             break
         result.append(next_token)
-        current = next_token
     return " → ".join(result)
 
 
 # =========================
 # 7. 테스트
 # =========================
-print(f"\nvocab_size : {vocab_size}개 토큰")
-print(f"embed_dim  : {EMBED_DIM}차원\n")
-
-print("ㅎ 으로 시작:", generate("ㅎ"))  # 하늘 패턴
-print("ㅂ 으로 시작:", generate("ㅂ"))  # 바람 패턴
-print("ㄴ 으로 시작:", generate("ㄴ"))  # 나무 패턴
+print()
+print("ㅎ 으로 시작:", generate("ㅎ"))  # 하늘
+print("ㅂ 으로 시작:", generate("ㅂ"))  # 바람
+print("ㄴ 으로 시작:", generate("ㄴ"))  # 나무
