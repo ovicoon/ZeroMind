@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AI Demo</title>
+</head>
+<body>
+
+  <h2>AI 실험</h2>
+
+  <input id="prompt" placeholder="문장 입력" />
+  <br><br>
+
+  <label>Temperature:</label>
+  <input id="temp" type="range" min="0" max="1" step="0.1" value="0.7" />
+  <span id="tempValue">0.7</span>
+
+  <br><br>
+
+  <button onclick="generate()">생성</button>
+
+  <h3>결과:</h3>
+  <div id="result"></div>
+
+<script>
+const tempSlider = document.getElementById("temp");
+const tempValue = document.getElementById("tempValue");
+
+tempSlider.oninput = () => {
+  tempValue.innerText = tempSlider.value;
+};
+
+async function generate() {
+  const prompt = document.getElementById("prompt").value;
+  const temperature = parseFloat(tempSlider.value);
+
+  const res = await fetch("http://localhost:5000/generate", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      prompt: prompt,
+      temperature: temperature
+    })
+  });
+
+  const data = await res.json();
+  console.log(data);
+  document.getElementById("result").innerText = data.result;
+}
+</script>
+
+</body>
+</html>
