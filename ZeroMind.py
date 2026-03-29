@@ -1,12 +1,13 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-from mistralai import Mistral
+from mistralai.client import Mistral
+import os
+
+API_KEY = os.getenv("MISTRAL_API_KEY")
 
 app = Flask(__name__)
 CORS(app)
 
-# 🔑 Mistral API 키
-API_KEY = "YOUR_API_KEY"
 client = Mistral(api_key=API_KEY)
 
 
@@ -18,7 +19,7 @@ def generate():
     temperature = data.get("temperature", 0.7)
 
     try:
-        # 👉 Mistral 호출
+        # Mistral 호출
         response = client.chat.complete(
             model="mistral-small-latest",
             messages=[{"role": "user", "content": prompt}],
@@ -30,7 +31,8 @@ def generate():
         return jsonify({"result": result})
 
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        print("ERROR:", e)
+        return jsonify({"error": str(e)})
 
 
 if __name__ == "__main__":
